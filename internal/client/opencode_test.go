@@ -13,19 +13,19 @@ func TestIsAnthropicModelOnlyRoutesNativeAnthropicModels(t *testing.T) {
 		want    bool
 	}{
 		{
-			name:    "minimax m2.5 uses anthropic endpoint",
+			name:    "minimax m2.5 uses openai endpoint on Go provider",
 			modelID: "minimax-m2.5",
-			want:    true,
+			want:    false,
 		},
 		{
-			name:    "minimax m2.7 uses anthropic endpoint",
+			name:    "minimax m2.7 uses openai endpoint on Go provider",
 			modelID: "minimax-m2.7",
-			want:    true,
+			want:    false,
 		},
 		{
-			name:    "minimax m3 uses anthropic endpoint",
+			name:    "minimax m3 uses openai endpoint on Go provider",
 			modelID: "minimax-m3",
-			want:    true,
+			want:    false,
 		},
 		{
 			name:    "deepseek pro uses openai endpoint",
@@ -63,44 +63,44 @@ func TestIsAnthropicModelOnlyRoutesNativeAnthropicModels(t *testing.T) {
 			want:    false,
 		},
 		{
-			name:    "qwen3.5-plus uses anthropic endpoint",
+			name:    "qwen3.5-plus uses openai endpoint on Go provider",
 			modelID: "qwen3.5-plus",
-			want:    true,
+			want:    false,
 		},
 		{
-			name:    "qwen3.6-plus uses anthropic endpoint",
+			name:    "qwen3.6-plus uses openai endpoint on Go provider",
 			modelID: "qwen3.6-plus",
-			want:    true,
+			want:    false,
 		},
 		{
-			name:    "qwen3.7-plus uses anthropic endpoint",
+			name:    "qwen3.7-plus uses openai endpoint on Go provider",
 			modelID: "qwen3.7-plus",
-			want:    true,
+			want:    false,
 		},
 		{
-			name:    "qwen3.7-max uses anthropic endpoint",
+			name:    "qwen3.7-max uses openai endpoint on Go provider",
 			modelID: "qwen3.7-max",
-			want:    true,
+			want:    false,
 		},
 		{
-			name:    "claude-sonnet-4-5 uses anthropic endpoint",
+			name:    "claude models use openai endpoint on Go provider",
 			modelID: "claude-sonnet-4-5",
-			want:    true,
+			want:    false,
 		},
 		{
-			name:    "claude-opus-4-7 uses anthropic endpoint",
+			name:    "claude-opus-4-7 uses openai endpoint on Go provider",
 			modelID: "claude-opus-4-7",
-			want:    true,
+			want:    false,
 		},
 		{
-			name:    "claude-haiku-4-5 uses anthropic endpoint",
+			name:    "claude-haiku-4-5 uses openai endpoint on Go provider",
 			modelID: "claude-haiku-4-5",
-			want:    true,
+			want:    false,
 		},
 		{
-			name:    "claude-3-5-haiku uses anthropic endpoint",
+			name:    "claude-3-5-haiku uses openai endpoint on Go provider",
 			modelID: "claude-3-5-haiku",
-			want:    true,
+			want:    false,
 		},
 	}
 

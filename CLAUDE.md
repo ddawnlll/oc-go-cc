@@ -20,14 +20,16 @@ Run a single test: `go test ./internal/router/ -v`
 
 **Purpose:** oc-go-cc is a proxy server that sits between Claude Code and OpenCode Go. It intercepts Anthropic API requests, transforms them to OpenAI Chat Completions format, forwards them to OpenCode Go, and transforms responses back to Anthropic SSE.
 
-**Model routing is config-driven, not code-driven.** Models are defined in `~/.config/oc-go-cc/config.json` — adding a new model does not require code changes (except for `IsAnthropicModel()` if the new model uses the Anthropic endpoint). The router in `internal/router/` selects models by matching request content against scenario patterns defined in `scenarios.go`.
+**Model routing is config-driven, not code-driven.** All models are defined in `~/.config/oc-go-cc/config.json` — adding a new model requires no code changes. Go provider models are transformed to OpenAI Chat Completions format automatically. Zen models use endpoint classification via `ClassifyEndpoint()`. The router in `internal/router/` selects models by matching request content against scenario patterns defined in `scenarios.go`.
+
+If a model's upstream doesn't support Anthropic tool format (`type: "custom"` server-tool shorthands), set `"anthropic_tools_disabled": true` in the model config to force it through the Chat Completions transform path instead of the raw Anthropic endpoint.
 
 **Two API endpoints:**
 
 - OpenAI endpoint (`/v1/chat/completions`) — used by most models (GLM, Kimi, MiMo, Qwen)
 - Anthropic endpoint (`/v1/messages`) — used only by MiniMax models
 
-`internal/client/opencode.go` routes by model ID via `IsAnthropicModel()`.
+`internal/client/opencode.go` routes Go provider models to Chat Completions; Zen models are classified by `ClassifyEndpoint()`. If a model's upstream doesn't support Anthropic tool format, set `anthropic_tools_disabled: true` in config.
 
 **Scenario detection priority** (`internal/router/scenarios.go`):
 

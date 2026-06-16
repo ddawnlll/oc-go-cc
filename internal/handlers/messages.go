@@ -342,21 +342,25 @@ func (h *MessagesHandler) handleStreaming(
 			endpointType := client.ClassifyEndpoint(model.ModelID)
 			switch endpointType {
 			case client.EndpointAnthropic:
-				modelBody := replaceModelInRawBody(rawBody, model.ModelID)
-				if err := h.handleAnthropicStreaming(ctx, rw, modelBody, model.ModelID, model); err != nil {
-					cancel()
-					if clientCtx.Err() == context.Canceled {
-						h.logger.Info("client disconnected during anthropic stream")
-						return
+				if model.AnthropicToolsDisabled {
+					// Fall through to OpenAI-compatible transform path below.
+				} else {
+					modelBody := replaceModelInRawBody(rawBody, model.ModelID)
+					if err := h.handleAnthropicStreaming(ctx, rw, modelBody, model.ModelID, model); err != nil {
+						cancel()
+						if clientCtx.Err() == context.Canceled {
+							h.logger.Info("client disconnected during anthropic stream")
+							return
+						}
+						h.logger.Warn("anthropic streaming failed", "model", model.ModelID, "error", err)
+						continue
 					}
-					h.logger.Warn("anthropic streaming failed", "model", model.ModelID, "error", err)
-					continue
+					cancel()
+					latency := time.Since(streamStart)
+					h.metrics.RecordSuccess(model.ModelID, latency)
+					h.logger.Info("streaming completed", "model", model.ModelID, "latency", latency)
+					return
 				}
-				cancel()
-				latency := time.Since(streamStart)
-				h.metrics.RecordSuccess(model.ModelID, latency)
-				h.logger.Info("streaming completed", "model", model.ModelID, "latency", latency)
-				return
 
 			case client.EndpointResponses:
 				if err := h.handleResponsesStreaming(ctx, rw, anthropicReq, model, clientCtx); err != nil {
@@ -499,6 +503,44 @@ func (h *MessagesHandler) handleGeminiStreaming(
 	return nil
 }
 
+// sanitizeAnthropicBody removes Anthropic-specific tool fields that some upstream
+// models don't understand (e.g., "type":"custom" server-tool shorthands used by
+// Claude Code for MCP tools). Returns the original body unchanged if no tools
+// array is present or if no tool has a type field.
+func sanitizeAnthropicBody(rawBody json.RawMessage) json.RawMessage {
+	var body map[string]any
+	if err := json.Unmarshal(rawBody, &body); err != nil {
+		return rawBody
+	}
+
+	tools, ok := body["tools"].([]any)
+	if !ok || len(tools) == 0 {
+		return rawBody
+	}
+
+	modified := false
+	for _, tool := range tools {
+		toolMap, ok := tool.(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, hasType := toolMap["type"]; hasType {
+			delete(toolMap, "type")
+			modified = true
+		}
+	}
+
+	if !modified {
+		return rawBody
+	}
+
+	result, err := json.Marshal(body)
+	if err != nil {
+		return rawBody
+	}
+	return json.RawMessage(result)
+}
+
 // replaceModelInRawBody replaces the model field in raw JSON body with the actual model ID.
 func replaceModelInRawBody(rawBody json.RawMessage, modelID string) json.RawMessage {
 	bodyStr := string(rawBody)
@@ -529,6 +571,10 @@ func (h *MessagesHandler) handleAnthropicStreaming(
 	modelID string,
 	model config.ModelConfig,
 ) error {
+	// Sanitize Anthropic-specific fields (e.g., tool type shorthands) that
+	// upstream models may not understand.
+	rawBody = sanitizeAnthropicBody(rawBody)
+
 	h.logger.Debug("sending anthropic streaming request",
 		"model_id", modelID,
 		"body_preview", string(rawBody)[:min(len(rawBody), 200)])
@@ -590,7 +636,11 @@ func (h *MessagesHandler) handleNonStreaming(
 				endpointType := client.ClassifyEndpoint(model.ModelID)
 				switch endpointType {
 				case client.EndpointAnthropic:
-					return h.executeAnthropicRequest(ctx, rawBody, model)
+					if model.AnthropicToolsDisabled {
+						// Fall through to OpenAI-compatible handling below.
+					} else {
+						return h.executeAnthropicRequest(ctx, rawBody, model)
+					}
 				case client.EndpointResponses:
 					return h.executeResponsesRequest(ctx, anthropicReq, model)
 				case client.EndpointGemini:
@@ -634,6 +684,10 @@ func (h *MessagesHandler) executeAnthropicRequest(
 	rawBody json.RawMessage,
 	model config.ModelConfig,
 ) ([]byte, error) {
+	// Sanitize Anthropic-specific fields (e.g., tool type shorthands) that
+	// upstream models may not understand.
+	rawBody = sanitizeAnthropicBody(rawBody)
+
 	resp, err := h.client.SendAnthropicRequest(ctx, rawBody, false, model)
 	if err != nil {
 		return nil, fmt.Errorf("anthropic request failed: %w", err)

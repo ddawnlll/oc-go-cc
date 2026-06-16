@@ -22,14 +22,15 @@ type Config struct {
 
 // ModelConfig defines routing rules for a specific model.
 type ModelConfig struct {
-	Provider         string          `json:"provider"`
-	ModelID          string          `json:"model_id"`
-	Temperature      float64         `json:"temperature"`
-	MaxTokens        int             `json:"max_tokens"`
-	ContextThreshold int             `json:"context_threshold"`
-	ReasoningEffort  string          `json:"reasoning_effort"`
-	Thinking         json.RawMessage `json:"thinking,omitempty"`
-	Vision           bool            `json:"vision"`
+	Provider               string          `json:"provider"`
+	ModelID                string          `json:"model_id"`
+	Temperature            float64         `json:"temperature"`
+	MaxTokens              int             `json:"max_tokens"`
+	ContextThreshold       int             `json:"context_threshold"`
+	ReasoningEffort        string          `json:"reasoning_effort"`
+	Thinking               json.RawMessage `json:"thinking,omitempty"`
+	Vision                 bool            `json:"vision"`
+	AnthropicToolsDisabled bool            `json:"anthropic_tools_disabled"`
 }
 
 // OpenCodeGoConfig holds the upstream OpenCode Go API settings.

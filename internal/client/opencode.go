@@ -67,15 +67,11 @@ func NewOpenCodeClient(atomic *config.AtomicConfig) *OpenCodeClient {
 }
 
 // IsAnthropicModel returns true if the model requires the Anthropic endpoint.
-// This includes both Go models (minimax, all qwen) and Zen models (claude, qwen3.7-max).
+// Go provider models use the Chat Completions transform path for broader
+// compatibility (tool format, message roles, etc.). Only Zen models use the
+// raw Anthropic endpoint, handled by ClassifyEndpoint in the Zen branch.
 func IsAnthropicModel(modelID string) bool {
-	switch modelID {
-	case "minimax-m2.5", "minimax-m2.7", "minimax-m3",
-		"qwen3.5-plus", "qwen3.6-plus", "qwen3.7-plus", "qwen3.7-max":
-		return true
-	default:
-		return isZenAnthropicModel(modelID)
-	}
+	return false
 }
 
 // isZenAnthropicModel returns true for models on Zen that use the Anthropic endpoint.
