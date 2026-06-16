@@ -78,9 +78,9 @@ func TestIsAnthropicModelOnlyRoutesNativeAnthropicModels(t *testing.T) {
 			want:    false,
 		},
 		{
-			name:    "qwen3.7-max uses openai endpoint on Go provider",
+			name:    "qwen3.7-max uses anthropic endpoint (no oa-compat support)",
 			modelID: "qwen3.7-max",
-			want:    false,
+			want:    true,
 		},
 		{
 			name:    "claude models use openai endpoint on Go provider",

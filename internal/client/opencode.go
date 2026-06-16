@@ -67,11 +67,19 @@ func NewOpenCodeClient(atomic *config.AtomicConfig) *OpenCodeClient {
 }
 
 // IsAnthropicModel returns true if the model requires the Anthropic endpoint.
-// Go provider models use the Chat Completions transform path for broader
-// compatibility (tool format, message roles, etc.). Only Zen models use the
-// raw Anthropic endpoint, handled by ClassifyEndpoint in the Zen branch.
+// Most Go provider models use the Chat Completions transform path for broader
+// compatibility (tool format, message roles, etc.). Exceptions are models whose
+// upstream backends don't support the OpenAI Chat Completions format and only
+// accept Anthropic Messages format.
+//
+// Only Zen models use the raw Anthropic endpoint via ClassifyEndpoint.
 func IsAnthropicModel(modelID string) bool {
-	return false
+	switch modelID {
+	case "qwen3.7-max": // OpenCode Go backend doesn't support oa-compat for this model
+		return true
+	default:
+		return false
+	}
 }
 
 // isZenAnthropicModel returns true for models on Zen that use the Anthropic endpoint.
