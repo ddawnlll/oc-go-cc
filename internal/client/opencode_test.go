@@ -2,6 +2,7 @@ package client
 
 import (
 	"testing"
+	"time"
 
 	"oc-go-cc/internal/config"
 )
@@ -459,5 +460,54 @@ func TestNextAPIKey_ConcurrentSafety(t *testing.T) {
 		if seen[key] != expectedPerKey {
 			t.Errorf("key %q seen %d times, want %d", key, seen[key], expectedPerKey)
 		}
+	}
+}
+
+func TestStreamIdleTimeout(t *testing.T) {
+	tests := []struct {
+		name      string
+		goMs      int
+		zenMs     int
+		provider  string
+		wantDur   time.Duration
+	}{
+		{
+			name:     "Go provider uses OpenCodeGo.StreamTimeoutMs",
+			goMs:     120000, // 2 min
+			provider: "opencode-go",
+			wantDur:  120 * time.Second,
+		},
+		{
+			name:     "Zen provider uses OpenCodeZen.StreamTimeoutMs",
+			goMs:     100000,
+			zenMs:    600000, // 10 min
+			provider: "opencode-zen",
+			wantDur:  10 * time.Minute,
+		},
+		{
+			name:     "falls back to OpenCodeGo.TimeoutMs when StreamTimeoutMs is zero",
+			goMs:     300000, // 5 min
+			provider: "opencode-go",
+			wantDur:  5 * time.Minute,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &config.Config{
+				OpenCodeGo:  config.OpenCodeGoConfig{TimeoutMs: tt.goMs, StreamTimeoutMs: tt.goMs},
+				OpenCodeZen: config.OpenCodeZenConfig{TimeoutMs: tt.zenMs, StreamTimeoutMs: tt.zenMs},
+			}
+			// Fallback test: zero out StreamTimeoutMs for that provider.
+			if tt.name == "falls back to OpenCodeGo.TimeoutMs when StreamTimeoutMs is zero" {
+				cfg.OpenCodeGo.StreamTimeoutMs = 0
+			}
+			atomic := config.NewAtomicConfig(cfg, "/tmp/test-config.json")
+			c := &OpenCodeClient{atomic: atomic}
+			mc := config.ModelConfig{Provider: tt.provider, ModelID: "test-model"}
+			got := c.StreamIdleTimeout(mc)
+			if got != tt.wantDur {
+				t.Errorf("StreamIdleTimeout() = %v, want %v", got, tt.wantDur)
+			}
+		})
 	}
 }

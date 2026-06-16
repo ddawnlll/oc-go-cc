@@ -328,14 +328,22 @@ func (h *MessagesHandler) handleStreaming(
 	for _, model := range modelChain {
 		select {
 		case <-clientCtx.Done():
-			h.logger.Info("client disconnected, stopping streaming fallbacks")
+			h.logger.Debug("client disconnected, stopping streaming fallbacks")
 			return
 		default:
 		}
 
 		h.logger.Info("attempting streaming model", "model", model.ModelID, "provider", model.Provider)
 
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		// Upstream context: no total deadline. The stream lives as long as
+		// data keeps flowing. Per-Read idle deadline is enforced in stream.go
+		// via http.ResponseController, so a stuck stream is still caught.
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			<-clientCtx.Done()
+			cancel()
+		}()
+		idleTimeout := h.client.StreamIdleTimeout(model)
 
 		// Zen models use their own endpoint classification
 		if client.IsZen(model) {
@@ -346,11 +354,15 @@ func (h *MessagesHandler) handleStreaming(
 					// Fall through to OpenAI-compatible transform path below.
 				} else {
 					modelBody := replaceModelInRawBody(rawBody, model.ModelID)
-					if err := h.handleAnthropicStreaming(ctx, rw, modelBody, model.ModelID, model); err != nil {
+					if err := h.handleAnthropicStreaming(ctx, rw, modelBody, model.ModelID, model, idleTimeout); err != nil {
 						cancel()
 						if clientCtx.Err() == context.Canceled {
-							h.logger.Info("client disconnected during anthropic stream")
+							h.logger.Debug("client disconnected during anthropic stream")
 							return
+						}
+						if err == transformer.ErrStreamIdle {
+							h.logger.Warn("upstream anthropic stream idle, trying next model", "model", model.ModelID, "idle_timeout", idleTimeout)
+							continue
 						}
 						h.logger.Warn("anthropic streaming failed", "model", model.ModelID, "error", err)
 						continue
@@ -363,11 +375,15 @@ func (h *MessagesHandler) handleStreaming(
 				}
 
 			case client.EndpointResponses:
-				if err := h.handleResponsesStreaming(ctx, rw, anthropicReq, model, clientCtx); err != nil {
+				if err := h.handleResponsesStreaming(ctx, rw, anthropicReq, model, clientCtx, idleTimeout); err != nil {
 					cancel()
 					if clientCtx.Err() == context.Canceled {
-						h.logger.Info("client disconnected during responses stream")
+						h.logger.Debug("client disconnected during responses stream")
 						return
+					}
+					if err == transformer.ErrStreamIdle {
+						h.logger.Warn("upstream responses stream idle, trying next model", "model", model.ModelID, "idle_timeout", idleTimeout)
+						continue
 					}
 					h.logger.Warn("responses streaming failed", "model", model.ModelID, "error", err)
 					continue
@@ -379,11 +395,15 @@ func (h *MessagesHandler) handleStreaming(
 				return
 
 			case client.EndpointGemini:
-				if err := h.handleGeminiStreaming(ctx, rw, anthropicReq, model, clientCtx); err != nil {
+				if err := h.handleGeminiStreaming(ctx, rw, anthropicReq, model, clientCtx, idleTimeout); err != nil {
 					cancel()
 					if clientCtx.Err() == context.Canceled {
-						h.logger.Info("client disconnected during gemini stream")
+						h.logger.Debug("client disconnected during gemini stream")
 						return
+					}
+					if err == transformer.ErrStreamIdle {
+						h.logger.Warn("upstream gemini stream idle, trying next model", "model", model.ModelID, "idle_timeout", idleTimeout)
+						continue
 					}
 					h.logger.Warn("gemini streaming failed", "model", model.ModelID, "error", err)
 					continue
@@ -411,23 +431,27 @@ func (h *MessagesHandler) handleStreaming(
 		if err != nil {
 			cancel()
 			if clientCtx.Err() == context.Canceled {
-				h.logger.Info("client disconnected during upstream request")
+				h.logger.Debug("client disconnected during upstream request")
 				return
 			}
 			h.logger.Warn("streaming request failed", "model", model.ModelID, "error", err)
 			continue
 		}
 
-		if err := h.streamHandler.ProxyStream(rw, streamBody, model.ModelID, clientCtx); err != nil {
+		if err := h.streamHandler.ProxyStream(rw, streamBody, model.ModelID, clientCtx, idleTimeout); err != nil {
 			_ = streamBody.Close()
 			cancel()
 			if err == transformer.ErrClientDisconnected {
-				h.logger.Info("client disconnected during stream")
+				h.logger.Debug("client disconnected during stream")
 				return
 			}
 			if clientCtx.Err() == context.Canceled {
-				h.logger.Info("client disconnected during stream (context canceled)")
+				h.logger.Debug("client disconnected during stream (context canceled)")
 				return
+			}
+			if err == transformer.ErrStreamIdle {
+				h.logger.Warn("upstream stream idle, trying next model", "model", model.ModelID, "idle_timeout", idleTimeout)
+				continue
 			}
 			h.logger.Warn("stream proxy failed", "model", model.ModelID, "error", err)
 			continue
@@ -456,6 +480,7 @@ func (h *MessagesHandler) handleResponsesStreaming(
 	anthropicReq *types.MessageRequest,
 	model config.ModelConfig,
 	clientCtx context.Context,
+	idleTimeout time.Duration,
 ) error {
 	req, err := h.requestTransformer.TransformToResponses(anthropicReq, model)
 	if err != nil {
@@ -467,7 +492,7 @@ func (h *MessagesHandler) handleResponsesStreaming(
 		return err
 	}
 
-	if err := h.streamHandler.ProxyResponsesStream(w, streamBody, model.ModelID, clientCtx); err != nil {
+	if err := h.streamHandler.ProxyResponsesStream(w, streamBody, model.ModelID, clientCtx, idleTimeout); err != nil {
 		_ = streamBody.Close()
 		return err
 	}
@@ -483,6 +508,7 @@ func (h *MessagesHandler) handleGeminiStreaming(
 	anthropicReq *types.MessageRequest,
 	model config.ModelConfig,
 	clientCtx context.Context,
+	idleTimeout time.Duration,
 ) error {
 	req, err := h.requestTransformer.TransformToGemini(anthropicReq, model)
 	if err != nil {
@@ -494,7 +520,7 @@ func (h *MessagesHandler) handleGeminiStreaming(
 		return err
 	}
 
-	if err := h.streamHandler.ProxyGeminiStream(w, streamBody, model.ModelID, clientCtx); err != nil {
+	if err := h.streamHandler.ProxyGeminiStream(w, streamBody, model.ModelID, clientCtx, idleTimeout); err != nil {
 		_ = streamBody.Close()
 		return err
 	}
@@ -570,6 +596,7 @@ func (h *MessagesHandler) handleAnthropicStreaming(
 	rawBody json.RawMessage,
 	modelID string,
 	model config.ModelConfig,
+	idleTimeout time.Duration,
 ) error {
 	// Sanitize Anthropic-specific fields (e.g., tool type shorthands) that
 	// upstream models may not understand.
@@ -585,15 +612,45 @@ func (h *MessagesHandler) handleAnthropicStreaming(
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	_, err = io.Copy(w, resp.Body)
-	if err != nil {
-		if ctx.Err() == context.Canceled {
-			return transformer.ErrClientDisconnected
-		}
-		return fmt.Errorf("failed to copy response: %w", err)
+	// Stream the body byte-by-byte so we can renew the idle read deadline
+	// between reads. This lets long-running Anthropic-format streams live
+	// as long as data keeps flowing while still aborting on a stuck
+	// connection.
+	buf := make([]byte, 4096)
+	if idleTimeout > 0 {
+		_ = transformer.SetUpstreamReadIdleDeadline(resp.Body, idleTimeout)
 	}
-
-	return nil
+	for {
+		select {
+		case <-ctx.Done():
+			return transformer.ErrClientDisconnected
+		default:
+		}
+		n, rerr := resp.Body.Read(buf)
+		if n > 0 {
+			if idleTimeout > 0 {
+				_ = transformer.SetUpstreamReadIdleDeadline(resp.Body, idleTimeout)
+			}
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return transformer.ErrClientDisconnected
+			}
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+		if rerr == io.EOF {
+			return nil
+		}
+		if rerr != nil {
+			if transformer.IsIdleTimeout(rerr) {
+				return transformer.ErrStreamIdle
+			}
+			if ctx.Err() == context.Canceled {
+				return transformer.ErrClientDisconnected
+			}
+			return fmt.Errorf("failed to copy response: %w", rerr)
+		}
+	}
 }
 
 // sendStreamError sends an error event in the SSE stream.

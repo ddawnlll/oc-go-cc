@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -17,6 +19,63 @@ import (
 
 // ErrClientDisconnected is returned when the client disconnects during streaming.
 var ErrClientDisconnected = fmt.Errorf("client disconnected")
+
+// ErrStreamIdle is returned when no bytes arrive within idleTimeout on the
+// upstream stream. The connection is stale (e.g. backend hang or network
+// partition). The handler decides whether to fall back to another model.
+var ErrStreamIdle = fmt.Errorf("upstream stream idle")
+
+// setReadIdleDeadline configures the upstream streaming body so the next Read
+// has an idleTimeout window. As long as the upstream keeps producing bytes,
+// the deadline is renewed before every Read and the stream lives indefinitely.
+// If no byte arrives within idleTimeout, Read returns a net.Error with
+// Timeout()==true, which the caller surfaces as ErrStreamIdle.
+//
+// Uses http.NewResponseController.SetReadDeadline (Go 1.20+). It works on
+// *http.Response.Body; for other readers (e.g. in tests) it's a no-op.
+//
+// Pass idleTimeout == 0 to disable the deadline (reads block indefinitely).
+func setReadIdleDeadline(body io.Reader, idleTimeout time.Duration) error {
+	if idleTimeout <= 0 {
+		return nil
+	}
+	type readDeadliner interface {
+		SetReadDeadline(time.Time) error
+	}
+	if rd, ok := body.(readDeadliner); ok {
+		return rd.SetReadDeadline(time.Now().Add(idleTimeout))
+	}
+	return nil
+}
+
+// SetUpstreamReadIdleDeadline is the public form of setReadIdleDeadline,
+// used by callers outside the transformer package (e.g. anthropic-format
+// streaming which uses io.Copy in a loop).
+func SetUpstreamReadIdleDeadline(body io.Reader, idleTimeout time.Duration) error {
+	return setReadIdleDeadline(body, idleTimeout)
+}
+
+// IsIdleTimeout reports whether err is a read-timeout (network deadline
+// exceeded on an otherwise live stream).
+func IsIdleTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	return false
+}
+
+// isIdleTimeoutErr returns true if err is a network read-timeout (deadline
+// exceeded on an otherwise alive stream).
+func isIdleTimeoutErr(err error) bool {
+	return IsIdleTimeout(err)
+}
 
 // StreamHandler handles streaming SSE transformation from OpenAI to Anthropic format.
 type StreamHandler struct {
@@ -36,11 +95,17 @@ func NewStreamHandler() *StreamHandler {
 //
 // CRITICAL: This function reads directly from resp.Body without buffering to minimize latency.
 // Per deep research: "Don't use bufio.Scanner or bufio.Reader on the response body - it adds buffering"
+//
+// idleTimeout is the maximum gap between bytes on the upstream stream. The
+// stream lives as long as data keeps flowing; only an idle period longer than
+// idleTimeout is treated as a stuck connection and surfaces as ErrStreamIdle.
+// Pass 0 to disable (stream lives until EOF or error).
 func (h *StreamHandler) ProxyStream(
 	w http.ResponseWriter,
 	openaiResp io.ReadCloser,
 	originalModel string,
 	clientCtx context.Context,
+	idleTimeout time.Duration,
 ) error {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -79,6 +144,11 @@ func (h *StreamHandler) ProxyStream(
 	// Read in larger chunks for efficiency, then parse lines
 	readBuf := make([]byte, 4096)
 
+	// Set the initial idle deadline on the upstream body before any read.
+	// Each successful read will renew it so the stream never times out while
+	// data is flowing.
+	_ = setReadIdleDeadline(openaiResp, idleTimeout)
+
 	for {
 		// Check if client disconnected
 		select {
@@ -90,6 +160,9 @@ func (h *StreamHandler) ProxyStream(
 		// Read chunk from upstream
 		n, err := openaiResp.Read(readBuf)
 		if n > 0 {
+			// Data is flowing — renew the idle deadline so the next Read
+			// has a fresh window.
+			_ = setReadIdleDeadline(openaiResp, idleTimeout)
 			// Process bytes immediately
 			for i := 0; i < n; i++ {
 				b := readBuf[i]
@@ -118,6 +191,9 @@ func (h *StreamHandler) ProxyStream(
 			break
 		}
 		if err != nil {
+			if isIdleTimeoutErr(err) {
+				return ErrStreamIdle
+			}
 			return fmt.Errorf("failed to read stream: %w", err)
 		}
 	}
@@ -599,6 +675,7 @@ func (h *StreamHandler) ProxyResponsesStream(
 	responsesResp io.ReadCloser,
 	originalModel string,
 	clientCtx context.Context,
+	idleTimeout time.Duration,
 ) error {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -627,6 +704,8 @@ func (h *StreamHandler) ProxyResponsesStream(
 	stopSent := false
 	readBuf := make([]byte, 4096)
 
+	_ = setReadIdleDeadline(responsesResp, idleTimeout)
+
 	for {
 		select {
 		case <-clientCtx.Done():
@@ -636,6 +715,7 @@ func (h *StreamHandler) ProxyResponsesStream(
 
 		n, err := responsesResp.Read(readBuf)
 		if n > 0 {
+			_ = setReadIdleDeadline(responsesResp, idleTimeout)
 			for i := 0; i < n; i++ {
 				b := readBuf[i]
 				if b == '\n' {
@@ -660,6 +740,9 @@ func (h *StreamHandler) ProxyResponsesStream(
 			break
 		}
 		if err != nil {
+			if isIdleTimeoutErr(err) {
+				return ErrStreamIdle
+			}
 			return fmt.Errorf("failed to read stream: %w", err)
 		}
 	}
@@ -777,6 +860,7 @@ func (h *StreamHandler) ProxyGeminiStream(
 	geminiResp io.ReadCloser,
 	originalModel string,
 	clientCtx context.Context,
+	idleTimeout time.Duration,
 ) error {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -805,6 +889,8 @@ func (h *StreamHandler) ProxyGeminiStream(
 	stopSent := false
 	readBuf := make([]byte, 4096)
 
+	_ = setReadIdleDeadline(geminiResp, idleTimeout)
+
 	for {
 		select {
 		case <-clientCtx.Done():
@@ -814,6 +900,7 @@ func (h *StreamHandler) ProxyGeminiStream(
 
 		n, err := geminiResp.Read(readBuf)
 		if n > 0 {
+			_ = setReadIdleDeadline(geminiResp, idleTimeout)
 			for i := 0; i < n; i++ {
 				b := readBuf[i]
 				if b == '\n' {
@@ -838,6 +925,9 @@ func (h *StreamHandler) ProxyGeminiStream(
 			break
 		}
 		if err != nil {
+			if isIdleTimeoutErr(err) {
+				return ErrStreamIdle
+			}
 			return fmt.Errorf("failed to read stream: %w", err)
 		}
 	}
