@@ -137,6 +137,121 @@ for b in blocks:
 	fi
 }
 
+# --- Streaming test helper ---
+test_streaming_model() {
+	local model=$1
+	local label=$2
+
+	echo -n "  [${label}] ${model} (streaming) ... "
+
+	REQUEST_BODY=$(cat <<'JSON'
+{
+	"model": "MODEL_PLACEHOLDER",
+	"tools": [
+		{
+			"type": "custom",
+			"name": "read_file",
+			"description": "Read a file from the filesystem",
+			"input_schema": {
+				"type": "object",
+				"properties": {
+					"path": {"type": "string"}
+				}
+			}
+		}
+	],
+	"messages": [
+		{
+			"role": "user",
+			"content": [
+				{"type": "text", "text": "Say hello and nothing else"}
+			]
+		}
+	],
+	"max_tokens": 100,
+	"stream": true
+}
+JSON
+)
+	REQUEST_BODY="${REQUEST_BODY//MODEL_PLACEHOLDER/$model}"
+
+	HTTP_CODE=$(curl -s -o /tmp/oc-go-cc-e2e-stream-response.txt -w '%{http_code}' \
+		-X POST "${BASE_URL}/v1/messages" \
+		-H "Content-Type: application/json" \
+		-H "x-api-key: ${OC_GO_CC_API_KEY}" \
+		-d "$REQUEST_BODY" \
+		--max-time "$TIMEOUT_SEC")
+
+	if [ "$HTTP_CODE" = 200 ]; then
+		# Verify it's a valid SSE stream: must have message_start and message_stop
+		if grep -q "event: message_start" /tmp/oc-go-cc-e2e-stream-response.txt && \
+		   grep -q "event: message_stop" /tmp/oc-go-cc-e2e-stream-response.txt; then
+			echo -e "${GREEN}PASS${NC} (200, valid SSE stream)"
+			pass=$((pass + 1))
+		else
+			echo -e "${RED}FAIL${NC} (200 but missing message_start/message_stop — corrupted SSE)"
+			head -c 400 /tmp/oc-go-cc-e2e-stream-response.txt
+			fail=$((fail + 1))
+		fi
+	else
+		ERROR_MSG=$(head -c 300 /tmp/oc-go-cc-e2e-stream-response.txt 2>/dev/null || echo "")
+		echo -e "${RED}FAIL${NC} (HTTP ${HTTP_CODE})"
+		echo "    Response: ${ERROR_MSG}"
+		fail=$((fail + 1))
+	fi
+}
+
+# --- Long streaming test helper (exercises heartbeat path) ---
+test_streaming_long() {
+	local model=$1
+	local label=$2
+
+	echo -n "  [${label}] ${model} (streaming long) ... "
+
+	REQUEST_BODY=$(cat <<'JSON'
+{
+	"model": "MODEL_PLACEHOLDER",
+	"messages": [
+		{
+			"role": "user",
+			"content": [
+				{"type": "text", "text": "Write a paragraph about the importance of testing in software engineering. Aim for 200 words."}
+			]
+		}
+	],
+	"max_tokens": 500,
+	"stream": true
+}
+JSON
+)
+	REQUEST_BODY="${REQUEST_BODY//MODEL_PLACEHOLDER/$model}"
+
+	HTTP_CODE=$(curl -s -o /tmp/oc-go-cc-e2e-stream-long.txt -w '%{http_code}' \
+		-X POST "${BASE_URL}/v1/messages" \
+		-H "Content-Type: application/json" \
+		-H "x-api-key: ${OC_GO_CC_API_KEY}" \
+		-d "$REQUEST_BODY" \
+		--max-time 120)
+
+	if [ "$HTTP_CODE" = 200 ]; then
+		if grep -q "event: message_start" /tmp/oc-go-cc-e2e-stream-long.txt && \
+		   grep -q "event: message_stop" /tmp/oc-go-cc-e2e-stream-long.txt; then
+			DELTA_COUNT=$(grep -c "event: content_block_delta" /tmp/oc-go-cc-e2e-stream-long.txt 2>/dev/null || echo 0)
+			echo -e "${GREEN}PASS${NC} (200, ${DELTA_COUNT} content deltas, valid SSE)"
+			pass=$((pass + 1))
+		else
+			echo -e "${RED}FAIL${NC} (200 but invalid SSE — missing start/stop)"
+			head -c 400 /tmp/oc-go-cc-e2e-stream-long.txt
+			fail=$((fail + 1))
+		fi
+	else
+		ERROR_MSG=$(head -c 300 /tmp/oc-go-cc-e2e-stream-long.txt 2>/dev/null || echo "")
+		echo -e "${RED}FAIL${NC} (HTTP ${HTTP_CODE})"
+		echo "    Response: ${ERROR_MSG}"
+		fail=$((fail + 1))
+	fi
+}
+
 # --- Test cases ---
 echo "=== E2E Model Tests (with tools and custom type) ==="
 echo ""
@@ -147,6 +262,16 @@ test_model "kimi-k2.7-code"   "Temperature fix (was 400)"
 test_model "deepseek-v4-pro"  "Thinking model"
 test_model "qwen3.7-plus"     "Go provider qwen (transform path)"
 test_model "qwen3.7-max"      "Anthropic endpoint + sanitization"
+
+echo ""
+echo "=== E2E Streaming Tests (SSE proxying, heartbeat safety) ==="
+echo ""
+
+test_streaming_model "deepseek-v4-flash" "Streaming + tools"
+test_streaming_model "deepseek-v4-pro"   "Streaming + thinking"
+test_streaming_model "kimi-k2.7-code"    "Streaming Go provider"
+test_streaming_model "minimax-m3"        "Streaming Anthropic endpoint"
+test_streaming_long  "deepseek-v4-flash" "Long stream (heartbeat)"
 
 echo ""
 echo "=== Results ==="

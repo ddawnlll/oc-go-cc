@@ -25,36 +25,6 @@ var ErrClientDisconnected = fmt.Errorf("client disconnected")
 // partition). The handler decides whether to fall back to another model.
 var ErrStreamIdle = fmt.Errorf("upstream stream idle")
 
-// setReadIdleDeadline configures the upstream streaming body so the next Read
-// has an idleTimeout window. As long as the upstream keeps producing bytes,
-// the deadline is renewed before every Read and the stream lives indefinitely.
-// If no byte arrives within idleTimeout, Read returns a net.Error with
-// Timeout()==true, which the caller surfaces as ErrStreamIdle.
-//
-// Uses http.NewResponseController.SetReadDeadline (Go 1.20+). It works on
-// *http.Response.Body; for other readers (e.g. in tests) it's a no-op.
-//
-// Pass idleTimeout == 0 to disable the deadline (reads block indefinitely).
-func setReadIdleDeadline(body io.Reader, idleTimeout time.Duration) error {
-	if idleTimeout <= 0 {
-		return nil
-	}
-	type readDeadliner interface {
-		SetReadDeadline(time.Time) error
-	}
-	if rd, ok := body.(readDeadliner); ok {
-		return rd.SetReadDeadline(time.Now().Add(idleTimeout))
-	}
-	return nil
-}
-
-// SetUpstreamReadIdleDeadline is the public form of setReadIdleDeadline,
-// used by callers outside the transformer package (e.g. anthropic-format
-// streaming which uses io.Copy in a loop).
-func SetUpstreamReadIdleDeadline(body io.Reader, idleTimeout time.Duration) error {
-	return setReadIdleDeadline(body, idleTimeout)
-}
-
 // IsIdleTimeout reports whether err is a read-timeout (network deadline
 // exceeded on an otherwise live stream).
 func IsIdleTimeout(err error) bool {
@@ -106,6 +76,7 @@ func (h *StreamHandler) ProxyStream(
 	originalModel string,
 	clientCtx context.Context,
 	idleTimeout time.Duration,
+	cancel context.CancelFunc,
 ) error {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -144,10 +115,11 @@ func (h *StreamHandler) ProxyStream(
 	// Read in larger chunks for efficiency, then parse lines
 	readBuf := make([]byte, 4096)
 
-	// Set the initial idle deadline on the upstream body before any read.
-	// Each successful read will renew it so the stream never times out while
-	// data is flowing.
-	_ = setReadIdleDeadline(openaiResp, idleTimeout)
+	// Start the idle watchdog. Each successful read pings the watchdog so
+	// the stream lives as long as data keeps flowing. If no bytes arrive
+	// within idleTimeout, cancel() is called, which aborts the upstream
+	// HTTP request and causes the next Read to return a context error.
+	ping := StartIdleWatchdog(clientCtx, cancel, idleTimeout)
 
 	for {
 		// Check if client disconnected
@@ -160,9 +132,9 @@ func (h *StreamHandler) ProxyStream(
 		// Read chunk from upstream
 		n, err := openaiResp.Read(readBuf)
 		if n > 0 {
-			// Data is flowing — renew the idle deadline so the next Read
-			// has a fresh window.
-			_ = setReadIdleDeadline(openaiResp, idleTimeout)
+			// Data is flowing — reset the idle watchdog so the stream
+			// lives as long as data keeps arriving.
+			ping()
 			// Process bytes immediately
 			for i := 0; i < n; i++ {
 				b := readBuf[i]
@@ -192,6 +164,12 @@ func (h *StreamHandler) ProxyStream(
 		}
 		if err != nil {
 			if isIdleTimeoutErr(err) {
+				return ErrStreamIdle
+			}
+			// When the idle watchdog fires, it cancels the upstream context
+			// which produces context.Canceled on Read. Distinguish that
+			// from a client disconnect by checking clientCtx.
+			if errors.Is(err, context.Canceled) && clientCtx.Err() == nil {
 				return ErrStreamIdle
 			}
 			return fmt.Errorf("failed to read stream: %w", err)
@@ -317,9 +295,22 @@ func (h *StreamHandler) processSSELine(
 		!strings.Contains(data, `"tool_calls"`) &&
 		!strings.Contains(data, `"usage"`) {
 		if idx := strings.Index(data, `"delta":{"content":"`); idx != -1 {
-			// Extract content directly
+			// Walk past JSON escape sequences to find the real closing
+			// quote. A naive strings.Index would stop at an escaped
+			// \" inside the content.
 			start := idx + len(`"delta":{"content":"`)
-			end := strings.Index(data[start:], `"`)
+			suffix := data[start:]
+			end := -1
+			for i := 0; i < len(suffix); i++ {
+				if suffix[i] == '\\' {
+					i++ // skip the escaped character
+					continue
+				}
+				if suffix[i] == '"' {
+					end = i
+					break
+				}
+			}
 			if end != -1 {
 				content := data[start : start+end]
 				if content != "" {
@@ -499,7 +490,11 @@ func (h *StreamHandler) processSSELine(
 					// already fully processed.
 					continue
 				}
-				if *contentStarted || *reasoningStarted {
+				// Close any existing content/reasoning block before opening the
+				// tool block.  Capture the state first so we know whether to
+				// advance contentIndex — the close itself clears the flags.
+				hadStartedBlock := *contentStarted || *reasoningStarted
+				if hadStartedBlock {
 					stopEvent := types.MessageEvent{
 						Type:  "content_block_stop",
 						Index: contentIndex,
@@ -511,7 +506,15 @@ func (h *StreamHandler) processSSELine(
 					*reasoningStarted = false
 				}
 				// First time seeing this logical tool call — start a new block.
-				*contentIndex++
+				// Only increment contentIndex when a previous text or reasoning
+				// block was already started, OR when a prior tool call has already
+				// claimed index 0 (parallel or sequential tool calls).  If nothing
+				// was started yet (single-tool response), the first tool block
+				// keeps contentIndex at 0 so the Anthropic SSE content block
+				// indices are contiguous.
+				if hadStartedBlock || len(startedToolCalls) > 0 {
+					*contentIndex++
+				}
 				*toolUseCount++
 				blockIdx = *contentIndex
 				startedToolCalls[oi] = blockIdx
@@ -676,6 +679,7 @@ func (h *StreamHandler) ProxyResponsesStream(
 	originalModel string,
 	clientCtx context.Context,
 	idleTimeout time.Duration,
+	cancel context.CancelFunc,
 ) error {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -704,7 +708,7 @@ func (h *StreamHandler) ProxyResponsesStream(
 	stopSent := false
 	readBuf := make([]byte, 4096)
 
-	_ = setReadIdleDeadline(responsesResp, idleTimeout)
+	ping := StartIdleWatchdog(clientCtx, cancel, idleTimeout)
 
 	for {
 		select {
@@ -715,7 +719,7 @@ func (h *StreamHandler) ProxyResponsesStream(
 
 		n, err := responsesResp.Read(readBuf)
 		if n > 0 {
-			_ = setReadIdleDeadline(responsesResp, idleTimeout)
+			ping()
 			for i := 0; i < n; i++ {
 				b := readBuf[i]
 				if b == '\n' {
@@ -741,6 +745,9 @@ func (h *StreamHandler) ProxyResponsesStream(
 		}
 		if err != nil {
 			if isIdleTimeoutErr(err) {
+				return ErrStreamIdle
+			}
+			if errors.Is(err, context.Canceled) && clientCtx.Err() == nil {
 				return ErrStreamIdle
 			}
 			return fmt.Errorf("failed to read stream: %w", err)
@@ -861,6 +868,7 @@ func (h *StreamHandler) ProxyGeminiStream(
 	originalModel string,
 	clientCtx context.Context,
 	idleTimeout time.Duration,
+	cancel context.CancelFunc,
 ) error {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -889,7 +897,7 @@ func (h *StreamHandler) ProxyGeminiStream(
 	stopSent := false
 	readBuf := make([]byte, 4096)
 
-	_ = setReadIdleDeadline(geminiResp, idleTimeout)
+	ping := StartIdleWatchdog(clientCtx, cancel, idleTimeout)
 
 	for {
 		select {
@@ -900,7 +908,7 @@ func (h *StreamHandler) ProxyGeminiStream(
 
 		n, err := geminiResp.Read(readBuf)
 		if n > 0 {
-			_ = setReadIdleDeadline(geminiResp, idleTimeout)
+			ping()
 			for i := 0; i < n; i++ {
 				b := readBuf[i]
 				if b == '\n' {
@@ -926,6 +934,9 @@ func (h *StreamHandler) ProxyGeminiStream(
 		}
 		if err != nil {
 			if isIdleTimeoutErr(err) {
+				return ErrStreamIdle
+			}
+			if errors.Is(err, context.Canceled) && clientCtx.Err() == nil {
 				return ErrStreamIdle
 			}
 			return fmt.Errorf("failed to read stream: %w", err)

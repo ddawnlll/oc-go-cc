@@ -9,6 +9,8 @@ import (
 	"oc-go-cc/internal/router"
 )
 
+func boolPtr(b bool) *bool { return &b }
+
 func TestAppendUniqueModels_DedupsByModelID(t *testing.T) {
 	base := []config.ModelConfig{
 		{Provider: "opencode-go", ModelID: "kimi-k2.6"},
@@ -301,7 +303,7 @@ func TestBuildModelChain_UnknownModel_FallsThroughToScenarioRoute(t *testing.T) 
 	// Requested model has no entry in model_overrides and not in models map,
 	// and respect_requested_model is false → scenario routing.
 	cfg := &config.Config{
-		RespectRequestedModel: false,
+		RespectRequestedModel: boolPtr(false),
 		Models: map[string]config.ModelConfig{
 			"default": {Provider: "opencode-go", ModelID: "kimi-k2.6"},
 		},
